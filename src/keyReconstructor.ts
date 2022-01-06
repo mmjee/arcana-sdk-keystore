@@ -17,6 +17,7 @@ import { decrypt, generatePrivate, getPublic } from 'eccrypto';
 import { keccak256, toChecksumAddress } from 'web3-utils';
 import { ec as EC } from 'elliptic';
 import NodeList from './nodes';
+
 import BN from 'bn.js';
 import {
   Logger,
@@ -25,6 +26,8 @@ import {
   setLogLevel,
   setExceptionReporter,
 } from './logger';
+import pMap from 'p-map'
+import pRetry from 'p-retry'
 const ec = new EC('secp256k1');
 
 interface NodeListFetcherResponse {
@@ -70,31 +73,45 @@ export class KeyReconstructor {
     verifier: string;
     id: string;
   }): Promise<PublicKey> => {
-    try {
-      const requestObj = generateJsonRPCObject('VerifierLookupRequest', {
-        verifier,
-        verifier_id: id,
-        app_id: this.appID,
-      });
-      const { nodes } = await this.nodeList.getNodes();
-      const data = await post(nodes[0], requestObj);
+    const requestObj = generateJsonRPCObject('VerifierLookupRequest', {
+      verifier,
+      verifier_id: id,
+      app_id: this.appID,
+    });
+    const cntNodesPerXY = new Map()
+    const nodeList = (await this.nodeList.getNodes()).nodes
+
+    await pMap(nodeList, (node) => pRetry(async () => {
+      const data = await post(node, requestObj);
       this.logger.info('get_public_key', { data });
-      if (data.ok) {
-        if (data.response.error) {
-          await this.assignKey(verifier, id);
-          return this.getPublicKey({ verifier, id });
-        } else {
-          const { pub_key_X: X, pub_key_Y: Y } = data.response?.result?.keys[0];
-          return { X, Y };
-        }
-      } else {
-        return Promise.reject('Error during getting public key');
+
+      if (!data.ok) {
+        return Promise.reject('Error during public key fetching')
       }
-    } catch (error) {
-      this.logger.error('get_public_key', { error: error.toString() });
-      return Promise.reject('Error during getting public key');
+      if (data.response.error) {
+        await this.assignKey(verifier, id)
+        return this.getPublicKey({ verifier, id })
+      }
+
+      const key0 = data.response?.result?.keys[0]
+      // Objects are compared by reference in the SVZ algorithm, so we need to JSON the key
+      const key = JSON.stringify(key0)
+      cntNodesPerXY.set(key, (cntNodesPerXY.get(key) ?? 0) + 1)
+    }, {
+      retries: 4
+    }))
+
+    const majorityCnt = Math.ceil(nodeList.length / 2) + 1
+    for (const [key, cnt] of cntNodesPerXY.entries()) {
+      if (cnt >= majorityCnt) {
+        const { pub_key_X: X, pub_key_Y: Y } = JSON.parse(key)
+        return { X, Y }
+      }
     }
-  };
+
+    // If we have reached here, that means there's no consensus
+    throw new Error('No consensus could be reached on the public key.')
+  }
 
   getPrivateKey = async ({
     id,
